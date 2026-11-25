@@ -385,7 +385,12 @@ impl SecretManager {
             .await
             .expect("unable to connect to container runtime");
 
-        let client = SpireClient::new(dc, cfg.cluster_domain.clone(), Box::new(pid_client), cfg);
+        let client = SpireClient::new(
+            dc,
+            cfg.spire_trust_domain.clone(),
+            Box::new(pid_client),
+            cfg,
+        );
 
         Ok(Self::new_with_client(client))
     }
@@ -395,7 +400,7 @@ impl SecretManager {
         dc: C,
         pid_client: Box<dyn PidClientTrait>,
     ) -> Result<Self, spiffe::error::GrpcClientError> {
-        let client = SpireClient::new(dc, cfg.cluster_domain.clone(), pid_client, cfg);
+        let client = SpireClient::new(dc, cfg.spire_trust_domain.clone(), pid_client, cfg);
 
         Ok(Self::new_with_client(client))
     }

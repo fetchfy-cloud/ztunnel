@@ -148,6 +148,8 @@ const SPIRE_TIMEOUT: &str = "SPIRE_TIMEOUT";
 
 const SPIRE_ADMIN_SOCKET: &str = "SPIRE_ADMIN_ENDPOINT_SOCKET";
 
+const SPIRE_TRUST_DOMAIN: &str = "SPIRE_TRUST_DOMAIN";
+
 const CONTAINER_RUNTIME_SOCK_PATH: &str = "CONTAINER_RUNTIME_SOCK_PATH";
 
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
@@ -361,6 +363,9 @@ pub struct Config {
     pub spire_enabled: bool,
     pub spire_timeout: Duration,
     pub spire_admin_socket: String,
+    // Trust domain whose SPIRE bundle verifies peers; defaults to the cluster domain, which is
+    // also the default trust domain of Istio.
+    pub spire_trust_domain: String,
     pub container_runtime_sock_path: String,
 }
 
@@ -621,6 +626,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         None => parse_default::<String>(CLUSTER_ID, DEFAULT_CLUSTER_ID.to_string())?,
     };
     let cluster_domain = parse_default(CLUSTER_DOMAIN, DEFAULT_CLUSTER_DOMAIN.to_string())?;
+    let spire_trust_domain = parse_default(SPIRE_TRUST_DOMAIN, cluster_domain.clone())?;
 
     let fake_ca = parse_default(FAKE_CA, false)?;
     let ca_address = validate_uri(empty_to_none(if fake_ca {
@@ -1001,6 +1007,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             SPIRE_ADMIN_SOCKET,
             "unix:///run/spire/sockets/admin.sock".to_string(),
         )?,
+        spire_trust_domain,
     })
 }
 
@@ -1311,6 +1318,25 @@ pub mod tests {
             let key: AsciiMetadataKey = AsciiMetadataKey::from_str(&k).unwrap();
             let value: AsciiMetadataValue = AsciiMetadataValue::from_str(&v).unwrap();
             assert!(metadata.vec.contains(&(key, value)));
+        }
+    }
+
+    #[test]
+    fn test_spire_trust_domain() {
+        unsafe {
+            env::remove_var(SPIRE_TRUST_DOMAIN);
+        }
+        let cfg = construct_config(ProxyConfig::default()).unwrap();
+        assert_eq!(cfg.spire_trust_domain, cfg.cluster_domain);
+
+        unsafe {
+            env::set_var(SPIRE_TRUST_DOMAIN, "prod.example.com");
+        }
+        let cfg = construct_config(ProxyConfig::default()).unwrap();
+        assert_eq!(cfg.spire_trust_domain, "prod.example.com");
+
+        unsafe {
+            env::remove_var(SPIRE_TRUST_DOMAIN);
         }
     }
 
