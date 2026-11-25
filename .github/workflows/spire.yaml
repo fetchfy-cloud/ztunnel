@@ -1,0 +1,90 @@
+# CI of the SPIRE fork: unit tests, the kind end-to-end test, and the image on
+# GHCR for tags. Upstream ztunnel runs its CI on Prow; this workflow covers only
+# what the fork adds and ships.
+#
+# Tags are named <istio version>-spire.<n>, as 1.32.0-spire.1, and the image is
+# ghcr.io/fetchfy-cloud/ztunnel:<tag>.
+name: spire
+
+on:
+  push:
+    branches: [spire-1.32]
+    tags: ["*-spire.*"]
+  pull_request:
+    branches: [spire-1.32]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Rust of the Istio build-tools image for 1.32; see Dockerfile.
+  RUST_IMAGE: docker.io/library/rust:1.97.1-bookworm
+  KIND_VERSION: v0.33.0
+
+jobs:
+  test:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Some tests enter network namespaces, so they run privileged, as the
+      # upstream build container does.
+      - name: fmt, clippy and tests
+        run: |
+          docker run --rm --privileged -v "$PWD":/src -w /src "$RUST_IMAGE" bash -euc '
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq protobuf-compiler cmake clang iptables iproute2 >/dev/null
+            rustup component add rustfmt clippy
+            cargo fmt --check
+            RUSTFLAGS="-D warnings" cargo clippy --benches --tests --bins
+            RUST_BACKTRACE=1 cargo test --benches --tests --bins
+          '
+
+  e2e:
+    needs: test
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # kind pods exhaust the default of 128 inotify instances of the runner.
+      #   https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files
+      - name: Raise inotify limits
+        run: sudo sysctl -w fs.inotify.max_user_instances=1280 fs.inotify.max_user_watches=655360
+      - name: Install kind
+        run: |
+          base="https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}"
+          curl -sSLo kind "$base/kind-linux-amd64"
+          curl -sSL "$base/kind-linux-amd64.sha256sum" | awk '{print $1"  kind"}' | sha256sum -c -
+          sudo install -m 0755 kind /usr/local/bin/kind
+      - name: Build the image
+        run: docker build -t ghcr.io/fetchfy-cloud/ztunnel:ci .
+      - name: End-to-end test
+        run: ZTUNNEL_IMAGE=ghcr.io/fetchfy-cloud/ztunnel:ci hack/spire-e2e/run.sh
+
+  image:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: e2e
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build and push
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/fetchfy-cloud/ztunnel:${TAG}"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker build -t "$image" .
+          docker push "$image"
