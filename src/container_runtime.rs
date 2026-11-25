@@ -28,7 +28,7 @@ use crate::{
     config::Config,
     container_runtime::cri::{ContainerStatusRequest, ListContainersRequest},
     identity::{PidClientTrait, WorkloadPid},
-    inpod::WorkloadUid,
+    state::WorkloadInfo,
 };
 
 pub mod cri {
@@ -73,13 +73,27 @@ impl ContainerRuntimeManager {
         Ok(endpoint)
     }
 
-    pub async fn get_pids_for_pod(&self, pod_uid: String) -> Result<Vec<i32>, tonic::Status> {
+    /// Returns the PIDs of the running containers of a pod, found by the
+    /// namespace and name labels that the kubelet puts on every sandbox. The
+    /// workload UID that istiod sends (`<cluster>//Pod/<ns>/<name>`) is not the
+    /// pod UID of the sandbox labels, while namespace and name are the same in
+    /// both, and they identify a single ready sandbox.
+    pub async fn get_pids_for_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<i32>, tonic::Status> {
         let mut client = self.runtime_client.clone();
+        let pod = format!("{namespace}/{name}");
 
-        tracing::info!("Fetching PIDs for pod UID: {}", pod_uid);
+        tracing::info!("Fetching PIDs for pod: {}", pod);
 
         let mut map: HashMap<String, String> = std::collections::HashMap::new();
-        map.insert("io.kubernetes.pod.uid".to_string(), pod_uid.clone());
+        map.insert(
+            "io.kubernetes.pod.namespace".to_string(),
+            namespace.to_string(),
+        );
+        map.insert("io.kubernetes.pod.name".to_string(), name.to_string());
 
         let ready_state = cri::PodSandboxStateValue {
             state: 0, // PodSandboxState::SandboxReady
@@ -107,23 +121,25 @@ impl ContainerRuntimeManager {
             }
         };
 
-        tracing::debug!(
-            "Found {} sandboxes for pod UID: {}",
-            sandboxes.len(),
-            pod_uid
-        );
+        tracing::debug!("Found {} sandboxes for pod: {}", sandboxes.len(), pod);
 
+        // A second ready sandbox for the name would make the pod ambiguous;
+        // fail closed rather than attest a process that may not be the pod.
+        if sandboxes.len() > 1 {
+            tracing::error!("{} ready sandboxes found for pod: {}", sandboxes.len(), pod);
+            return Err(tonic::Status::failed_precondition(format!(
+                "{} ready sandboxes found for pod: {}",
+                sandboxes.len(),
+                pod
+            )));
+        }
         let sandbox = sandboxes.first().ok_or_else(|| {
-            tracing::error!("No sandbox found for pod UID: {}", pod_uid);
-            tonic::Status::not_found(format!("No sandbox found for pod UID: {}", pod_uid))
+            tracing::error!("No sandbox found for pod: {}", pod);
+            tonic::Status::not_found(format!("No sandbox found for pod: {}", pod))
         })?;
 
         let sandbox_id = sandbox.id.clone();
-        tracing::info!(
-            "Found sandbox for pod UID: {}, sandbox_id: {}",
-            pod_uid,
-            sandbox_id
-        );
+        tracing::info!("Found sandbox for pod: {}, sandbox_id: {}", pod, sandbox_id);
 
         let container_ready = cri::ContainerStateValue {
             state: 1, // ContainerState::ContainerRunning
@@ -205,17 +221,17 @@ impl ContainerRuntimeManager {
         }
 
         if pids.is_empty() {
-            tracing::error!("No running containers found for pod UID: {}", pod_uid);
+            tracing::error!("No running containers found for pod: {}", pod);
             return Err(tonic::Status::not_found(format!(
-                "No running containers found for pod UID: {}",
-                pod_uid
+                "No running containers found for pod: {}",
+                pod
             )));
         }
 
         tracing::info!(
-            "Successfully collected {} PIDs for pod UID: {}",
+            "Successfully collected {} PIDs for pod: {}",
             pids.len(),
-            pod_uid
+            pod
         );
         Ok(pids)
     }
@@ -223,9 +239,9 @@ impl ContainerRuntimeManager {
 
 #[async_trait]
 impl PidClientTrait for ContainerRuntimeManager {
-    async fn fetch_pid(&self, uid: &WorkloadUid) -> Result<WorkloadPid, std::io::Error> {
+    async fn fetch_pid(&self, workload: &WorkloadInfo) -> Result<WorkloadPid, std::io::Error> {
         let pids = self
-            .get_pids_for_pod(uid.clone().into_string())
+            .get_pids_for_pod(&workload.namespace, &workload.name)
             .await
             .map_err(|e| std::io::Error::other(format!("CRI error: {}", e)))?;
 
@@ -399,7 +415,8 @@ mod tests {
                 id: "fake-sandbox-123".into(),
                 labels: {
                     let mut m = HashMap::new();
-                    m.insert("io.kubernetes.pod.uid".into(), "fake-uid-456".into());
+                    m.insert("io.kubernetes.pod.namespace".into(), "default".into());
+                    m.insert("io.kubernetes.pod.name".into(), "fake-uid-456".into());
                     m
                 },
                 ..Default::default()
@@ -468,12 +485,12 @@ mod tests {
         // 6. Call the real client method against the mock server
         let cri_manager = ContainerRuntimeManager::new_with_client(client);
         let pids_result = cri_manager
-            .get_pids_for_pod("non-existent-pod-uid".to_string())
+            .get_pids_for_pod("default", "non-existent-pod-uid")
             .await;
         assert!(pids_result.is_err()); // Since our mock returns no sandboxes matching the UID, this should error
 
         let pids_result = cri_manager
-            .get_pids_for_pod("fake-uid-456".to_string())
+            .get_pids_for_pod("default", "fake-uid-456")
             .await;
         assert!(pids_result.is_ok());
         assert_eq!(pids_result.unwrap(), vec![4321]);
@@ -531,7 +548,8 @@ mod tests {
                 state: 1, // SANDBOX_NOTREADY
                 labels: {
                     let mut m = HashMap::new();
-                    m.insert("io.kubernetes.pod.uid".into(), "not-ready-pod-uid".into());
+                    m.insert("io.kubernetes.pod.namespace".into(), "default".into());
+                    m.insert("io.kubernetes.pod.name".into(), "not-ready-pod-uid".into());
                     m
                 },
                 ..Default::default()
@@ -543,13 +561,48 @@ mod tests {
 
         let cri_manager = ContainerRuntimeManager::new_with_client(client);
         let result = cri_manager
-            .get_pids_for_pod("not-ready-pod-uid".to_string())
+            .get_pids_for_pod("default", "not-ready-pod-uid")
             .await;
 
         // Should return not found because sandbox is not in Ready state
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn test_two_ready_sandboxes_for_a_pod_fail_closed() {
+        // Two ready sandboxes with the same namespace and name make the pod
+        // ambiguous, so no PID is returned
+        let mock = MockRuntimeService::default();
+        {
+            let mut lock = mock.sandboxes.lock().await;
+            for id in ["sandbox-a", "sandbox-b"] {
+                lock.push(cri::PodSandbox {
+                    id: id.into(),
+                    state: 0, // SANDBOX_READY
+                    labels: {
+                        let mut m = HashMap::new();
+                        m.insert("io.kubernetes.pod.namespace".into(), "default".into());
+                        m.insert("io.kubernetes.pod.name".into(), "twin".into());
+                        m
+                    },
+                    ..Default::default()
+                });
+            }
+        }
+
+        let socket_path = "/tmp/test-cri-two-sandboxes.sock";
+        let (client, server_handle) = setup_mock_server(mock, socket_path).await;
+
+        let cri_manager = ContainerRuntimeManager::new_with_client(client);
+        let result = cri_manager.get_pids_for_pod("default", "twin").await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
 
         server_handle.abort();
         let _ = std::fs::remove_file(socket_path);
@@ -567,8 +620,9 @@ mod tests {
                 state: 0, // SANDBOX_READY
                 labels: {
                     let mut m = HashMap::new();
+                    m.insert("io.kubernetes.pod.namespace".into(), "default".into());
                     m.insert(
-                        "io.kubernetes.pod.uid".into(),
+                        "io.kubernetes.pod.name".into(),
                         "pod-with-exited-containers".into(),
                     );
                     m
@@ -611,7 +665,7 @@ mod tests {
 
         let cri_manager = ContainerRuntimeManager::new_with_client(client);
         let result = cri_manager
-            .get_pids_for_pod("pod-with-exited-containers".to_string())
+            .get_pids_for_pod("default", "pod-with-exited-containers")
             .await;
 
         // Should return NotFound error since no containers are running
@@ -635,7 +689,8 @@ mod tests {
                 state: 0, // SANDBOX_READY
                 labels: {
                     let mut m = HashMap::new();
-                    m.insert("io.kubernetes.pod.uid".into(), "mixed-state-pod".into());
+                    m.insert("io.kubernetes.pod.namespace".into(), "default".into());
+                    m.insert("io.kubernetes.pod.name".into(), "mixed-state-pod".into());
                     m
                 },
                 ..Default::default()
@@ -695,7 +750,7 @@ mod tests {
 
         let cri_manager = ContainerRuntimeManager::new_with_client(client);
         let result = cri_manager
-            .get_pids_for_pod("mixed-state-pod".to_string())
+            .get_pids_for_pod("default", "mixed-state-pod")
             .await;
 
         // Should only return the PID of the running container
