@@ -322,7 +322,8 @@ pub async fn build(config: Arc<config::Config>) -> anyhow::Result<Bound> {
     let cert_manager = if config.fake_ca {
         mock_secret_manager()
     } else if config.spire_enabled {
-        let dc = DelegatedIdentityClient::default().await?;
+        // The socket comes from the config, which defaults it when the variable is unset.
+        let dc = DelegatedIdentityClient::new_from_path(&config.spire_admin_socket).await?;
         Arc::new(SecretManager::new_with_spire_client(config.clone(), dc).await?)
     } else {
         Arc::new(SecretManager::new(config.clone()).await?)
