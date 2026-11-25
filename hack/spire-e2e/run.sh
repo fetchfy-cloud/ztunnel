@@ -74,15 +74,9 @@ step "kind cluster"
 "$KIND" create cluster --config "$HERE/kind.yaml" --kubeconfig "$KUBECONFIG" --wait 120s
 "$KIND" load docker-image "$ZTUNNEL_IMAGE" --name "$CLUSTER"
 
-step "SPIRE $SPIRE_VERSION"
-helm upgrade --install spire-crds spire-crds --repo "$SPIRE_REPO" --version "$SPIRE_CRDS_VERSION" \
-  -n spire-mgmt --create-namespace --wait
-helm upgrade --install spire spire --repo "$SPIRE_REPO" --version "$SPIRE_VERSION" \
-  -n spire-mgmt -f "$HERE/spire-values.yaml" \
-  --set global.spire.namespaces.create=true --wait --timeout 10m
-kubectl apply -f "$HERE/clusterspiffeids.yaml"
-
-step "Istio $ISTIO_VERSION ambient, ztunnel $ZTUNNEL_IMAGE"
+# Istio first and SPIRE after, the order of the cloud-provider: ztunnel must
+# start and get ready before the SPIRE agent of its node exists.
+step "Istio $ISTIO_VERSION ambient, ztunnel $ZTUNNEL_IMAGE (before SPIRE)"
 helm upgrade --install istio-base base --repo "$ISTIO_REPO" --version "$ISTIO_VERSION" \
   -n istio-system --create-namespace --wait
 helm upgrade --install istiod istiod --repo "$ISTIO_REPO" --version "$ISTIO_VERSION" \
@@ -92,6 +86,14 @@ helm upgrade --install istio-cni cni --repo "$ISTIO_REPO" --version "$ISTIO_VERS
 helm upgrade --install ztunnel ztunnel --repo "$ISTIO_REPO" --version "$ISTIO_VERSION" \
   -n istio-system -f "$HERE/ztunnel-values.yaml" \
   --set image="$ZTUNNEL_IMAGE" --set imagePullPolicy=Never --wait --timeout 5m
+
+step "SPIRE $SPIRE_VERSION"
+helm upgrade --install spire-crds spire-crds --repo "$SPIRE_REPO" --version "$SPIRE_CRDS_VERSION" \
+  -n spire-mgmt --create-namespace --wait
+helm upgrade --install spire spire --repo "$SPIRE_REPO" --version "$SPIRE_VERSION" \
+  -n spire-mgmt -f "$HERE/spire-values.yaml" \
+  --set global.spire.namespaces.create=true --wait --timeout 10m
+kubectl apply -f "$HERE/clusterspiffeids.yaml"
 
 step "workloads"
 kubectl apply -f "$HERE/workloads.yaml"

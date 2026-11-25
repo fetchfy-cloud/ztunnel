@@ -8,10 +8,12 @@ env:
   # handshake and the renewal check exercises every new certificate.
   POOL_MAX_STREAMS_PER_CONNECTION: "1"
 volumes:
+  # ztunnel is installed before SPIRE, as the cloud-provider does, so the
+  # directory may not exist yet. The SPIRE agent mounts it the same way.
   - name: spire-admin
     hostPath:
       path: /run/spire/agent/sockets/csi.spiffe.io/admin
-      type: Directory
+      type: DirectoryOrCreate
   - name: containerd
     hostPath:
       path: /run/containerd/containerd.sock
