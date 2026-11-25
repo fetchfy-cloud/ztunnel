@@ -39,6 +39,10 @@ use educe::Educe;
 use keyed_priority_queue::KeyedPriorityQueue;
 
 const CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL: Duration = Duration::from_secs(150);
+// How long to wait before fetching again a certificate that was already due for a refresh when it
+// was fetched. A SPIRE agent hands out the SVID it holds until it rotates it, at 45-55% of its
+// lifetime and checked on its 5s sync, so a fetch at half-life can return the same SVID.
+const CERT_REFRESH_DUE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Default trust domain to use if not otherwise specified.
 pub const DEFAULT_TRUST_DOMAIN: &str = "cluster.local";
@@ -460,19 +464,26 @@ impl Worker {
                             // Reset (pop and drop) the backoff on success.
                             pending_backoffs_by_key.remove(&key);
                             let certs: tls::WorkloadCertificate = certs; // Type annotation.
-                            let refresh_at = self.time_conv.system_time_to_instant(certs.refresh_at());
-                            let refresh_at = if let Some(t) = refresh_at {
-                                t.into()
-                            } else {
-                                // Malformed certificate (not_after is way too much into the
-                                // past or the future). Queue another refresh soon.
+                            let now = Instant::now();
+                            let refresh_at = match self.time_conv.system_time_to_instant(certs.refresh_at()) {
+                                Some(t) if Instant::from(t) > now => t.into(),
+                                // The certificate is already due for a refresh, or malformed
+                                // (not_after is way too much into the past or the future).
+                                // Fetching it again at once would loop for as long as the CA
+                                // hands out the same certificate, so retry after a short delay,
+                                // but not past its expiry.
                                 //
-                                // TODO: This is a bit inconsistent since we still return the
-                                // certificate to the caller successfully. Basically the
-                                // behavior is silly, but simple and avoid panics in time math.
-                                // We'll try to get rid of the SystemTime <-> Instant
-                                // conversion here, so for now leaving the code as is.
-                                Instant::now()
+                                // TODO: This is a bit inconsistent since we still return a
+                                // malformed certificate to the caller successfully. We'll try
+                                // to get rid of the SystemTime <-> Instant conversion here, so
+                                // for now leaving the code as is.
+                                _ => {
+                                    let retry_at = now + CERT_REFRESH_DUE_RETRY_DELAY;
+                                    match self.time_conv.system_time_to_instant(certs.cert.expiration().not_after) {
+                                        Some(t) if Instant::from(t) > now => retry_at.min(t.into()),
+                                        _ => retry_at,
+                                    }
+                                }
                             };
                             (CertState::Available(Arc::new(certs)), refresh_at)
                         },
@@ -935,12 +946,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_cache_refresh() {
-        let test_dur = Duration::from_millis(200);
+        let test_dur = Duration::from_millis(1000);
 
         let id: Identity = Default::default();
 
-        // Certs added to the cache should be refreshed every 25 millis
-        let cert_lifetime = Duration::from_millis(50);
+        // Certs added to the cache should be refreshed every 500 millis. A shorter lifetime can
+        // pass its half-life while the test certificate is generated; a certificate already due
+        // on arrival is fetched again only after CERT_REFRESH_DUE_RETRY_DELAY.
+        let cert_lifetime = Duration::from_millis(1000);
         let secret_manager = mock::new_secret_manager(cert_lifetime);
 
         // Start spamming fetches for that cert.
@@ -1395,6 +1408,83 @@ mod tests {
         }
 
         test.tear_down().await;
+    }
+
+    // Hands out the certificate it holds until it rotates it, past the half-life of the
+    // certificate, as a SPIRE agent does.
+    #[derive(Clone)]
+    struct AgentLikeCaClient {
+        time_conv: crate::time::Converter,
+        lifetime: Duration,
+        rotate_after: Duration,
+        // The validity start of the certificate held, and the number of fetches.
+        state: Arc<Mutex<(Option<std::time::SystemTime>, usize)>>,
+    }
+
+    #[async_trait]
+    impl CaClientTrait for AgentLikeCaClient {
+        async fn fetch_certificate(
+            &self,
+            key: &CacheKey,
+        ) -> Result<tls::WorkloadCertificate, Error> {
+            // Lets the paused clock move on between fetches.
+            tokio::time::sleep(10 * MILLISEC).await;
+            let now = self
+                .time_conv
+                .instant_to_system_time(Instant::now().into())
+                .unwrap();
+            let mut state = self.state.lock().await;
+            state.1 += 1;
+            let not_before = match state.0 {
+                Some(t) if now < t + self.rotate_after => t,
+                _ => now,
+            };
+            state.0 = Some(not_before);
+            Ok(tls::mock::CertGenerator::default().new_certs(
+                &key.identity().to_owned().into(),
+                not_before,
+                not_before + self.lifetime,
+            ))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_due_certificate_is_not_fetched_in_a_loop() {
+        let time_conv = crate::time::Converter::new();
+        let client = AgentLikeCaClient {
+            time_conv: time_conv.clone(),
+            lifetime: 2 * CERT_HALFLIFE,
+            // The latest an agent rotates, at 55% of the lifetime.
+            rotate_after: CERT_HALFLIFE * 11 / 10,
+            state: Default::default(),
+        };
+        let (secret_manager, worker) = SecretManager::new_internal(
+            Box::new(client.clone()),
+            SecretManagerConfig {
+                time_conv,
+                concurrency: 1,
+            },
+        );
+        let id = identity("agent");
+        let start = Instant::now();
+
+        let initial = secret_manager.fetch_certificate(&id).await.unwrap();
+        // The refresh at half-life gets the same certificate back. It must wait before fetching
+        // again instead of fetching in a loop until the agent rotates the certificate.
+        tokio::time::sleep_until(start + client.rotate_after + 2 * CERT_REFRESH_DUE_RETRY_DELAY)
+            .await;
+        let rotated = secret_manager.fetch_certificate(&id).await.unwrap();
+
+        assert!(
+            initial.cert.expiration().not_before < rotated.cert.expiration().not_before,
+            "the certificate was not rotated"
+        );
+        // The initial fetch, the one at half-life and one retry after the delay.
+        let fetches = client.state.lock().await.1;
+        assert_eq!(fetches, 3, "fetched {fetches} times");
+
+        drop(secret_manager);
+        worker.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
