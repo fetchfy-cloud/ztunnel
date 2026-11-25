@@ -26,7 +26,9 @@ use tracing::{debug, error, info};
 /// Responsible for pre-fetching certs for workloads.
 pub trait CertFetcher: Send + Sync {
     fn prefetch_cert(&self, w: &Workload);
-    fn clear_cert(&self, w: &Workload);
+    /// Called on every real removal of a workload. last_identity_on_node tells
+    /// whether no other workload on the node still uses its identity.
+    fn clear_cert(&self, w: &Workload, last_identity_on_node: bool);
 }
 
 /// A no-op implementation of [CertFetcher].
@@ -34,7 +36,7 @@ pub struct NoCertFetcher();
 
 impl CertFetcher for NoCertFetcher {
     fn prefetch_cert(&self, _: &Workload) {}
-    fn clear_cert(&self, _: &Workload) {}
+    fn clear_cert(&self, _: &Workload, _: bool) {}
 }
 
 /// Constructs an appropriate [CertFetcher] for the proxy config.
@@ -133,7 +135,10 @@ impl CertFetcher for CertFetcherImpl {
         }
     }
 
-    fn clear_cert(&self, w: &Workload) {
+    fn clear_cert(&self, w: &Workload, last_identity_on_node: bool) {
+        // A workload-keyed entry belongs to this pod alone, so SPIRE mode drops
+        // it on every removal. The identity-keyed entry is shared by the pods
+        // of the identity, so it goes only with the last of them.
         let req = if self.spire_enabled {
             PrefetchRequest::ForgetWorkload {
                 id: w.identity(),
@@ -144,11 +149,90 @@ impl CertFetcher for CertFetcherImpl {
                     w.service_account.to_string(),
                 )),
             }
-        } else {
+        } else if last_identity_on_node {
             PrefetchRequest::Forget(w.identity())
+        } else {
+            return;
         };
         if let Err(e) = self.tx.try_send(req) {
             info!("couldn't clear identity: {:?}", e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::identity::mock::new_secret_manager;
+    use crate::strng;
+    use crate::test_helpers::{test_config, test_default_workload};
+
+    fn workload(uid: &str) -> Workload {
+        Workload {
+            uid: strng::new(uid),
+            ..test_default_workload()
+        }
+    }
+
+    fn info(w: &Workload) -> Arc<WorkloadInfo> {
+        Arc::new(WorkloadInfo::new(
+            w.name.to_string(),
+            w.namespace.to_string(),
+            w.service_account.to_string(),
+        ))
+    }
+
+    // The fetcher forgets through a channel, so wait for the cache to settle.
+    async fn wait_for_len(cm: &SecretManager, want: usize) {
+        for _ in 0..100 {
+            if cm.cache_len().await == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cm.cache_len().await, want);
+    }
+
+    #[tokio::test]
+    async fn spire_clears_the_cert_of_each_removed_pod() {
+        let mut cfg = test_config();
+        cfg.proxy_mode = ProxyMode::Shared;
+        cfg.spire_enabled = true;
+        let cm = new_secret_manager(Duration::from_secs(10));
+        let fetcher = CertFetcherImpl::new(&cfg, cm.clone());
+
+        let (a, b) = (workload("pod-a"), workload("pod-b"));
+        for w in [&a, &b] {
+            cm.fetch_certificate_by_workload(&w.identity(), info(w), w.uid.clone())
+                .await
+                .unwrap();
+        }
+        assert_eq!(cm.cache_len().await, 2);
+
+        // Pod b still uses the identity, but the cert of pod a is its own.
+        fetcher.clear_cert(&a, false);
+        wait_for_len(&cm, 1).await;
+        let left = cm.collect_certs(|k, _| k.to_string()).await;
+        assert!(left[0].contains("pod-b"), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn istio_ca_keeps_the_cert_while_the_identity_is_in_use() {
+        let mut cfg = test_config();
+        cfg.proxy_mode = ProxyMode::Shared;
+        let cm = new_secret_manager(Duration::from_secs(10));
+        let fetcher = CertFetcherImpl::new(&cfg, cm.clone());
+
+        let w = workload("pod-a");
+        cm.fetch_certificate(&w.identity()).await.unwrap();
+
+        fetcher.clear_cert(&w, false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cm.cache_len().await, 1);
+
+        fetcher.clear_cert(&w, true);
+        wait_for_len(&cm, 0).await;
     }
 }

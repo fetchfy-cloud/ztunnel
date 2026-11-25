@@ -275,14 +275,13 @@ impl ProxyStateUpdateMutator {
                 acc.remove(svc.clone(), prev.uid.clone());
             }
 
-            // This is a real removal (not a removal before insertion), and nothing else references the cert
-            // Clear it out
-            if !for_workload_insert
-                && state
+            // This is a real removal (not a removal before insertion). The fetcher clears what
+            // nothing else references: the pod's own cert, or the identity's with its last pod.
+            if !for_workload_insert {
+                let last = state
                     .workloads
-                    .was_last_identity_on_node(&prev.node, &prev.identity())
-            {
-                self.cert_fetcher.clear_cert(&prev);
+                    .was_last_identity_on_node(&prev.node, &prev.identity());
+                self.cert_fetcher.clear_cert(&prev, last);
             }
             // We removed a workload, no reason to attempt to remove a service with the same name
             return;
