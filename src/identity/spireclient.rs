@@ -69,6 +69,31 @@ impl DelegatedIdentityApi for DelegatedIdentityClient {
     }
 }
 
+/// Returns a client of the Delegated Identity API of the SPIRE agent at
+/// `socket` (`unix:///path` or a plain path) that connects on its first
+/// request instead of at startup.
+///
+/// ztunnel may start before the SPIRE agent of its node has created the
+/// socket: the agent may be installed after ztunnel, or be restarting.
+/// Connecting at startup would make ztunnel exit. With a lazy channel each
+/// certificate fetch fails instead, and the SecretManager retries it with its
+/// backoff; the channel connects again whenever the agent comes back.
+pub fn lazy_delegated_identity_client(socket: &str) -> Result<DelegatedIdentityClient, Error> {
+    // Like DelegatedIdentityClient::new_from_path, which connects at once.
+    let path = socket.strip_prefix("unix:").unwrap_or(socket).to_string();
+    // tonic requires a URI, but the connector below dials the socket instead.
+    let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector_lazy(tower::service_fn(move |_: tonic::transport::Uri| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }));
+    DelegatedIdentityClient::new(channel).map_err(|e| Error::Spiffe(e.to_string()))
+}
+
 #[derive(
     Eq, PartialEq, Hash, Debug, Clone, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Copy,
 )]
@@ -429,6 +454,27 @@ pub mod spire_tests {
     use spiffe::*;
 
     use rcgen::ExtendedKeyUsagePurpose as EKU;
+
+    #[tokio::test]
+    async fn test_lazy_client_dials_the_socket_once_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.sock");
+        let socket = format!("unix://{}", path.display());
+
+        // ztunnel may start before the SPIRE agent creates the socket.
+        let client = lazy_delegated_identity_client(&socket).expect("no connection at startup");
+        assert!(client.clone().fetch_x509_bundles().await.is_err());
+
+        // Once the socket exists, the next request dials it.
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let request = tokio::spawn(async move { client.clone().fetch_x509_bundles().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .expect("the client did not dial the socket")
+            .unwrap();
+        drop(listener);
+        let _ = request.await;
+    }
 
     #[tokio::test]
     async fn test_get_bundle_success() {

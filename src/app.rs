@@ -17,9 +17,9 @@ use std::future::Future;
 use crate::proxyfactory::ProxyFactory;
 
 use crate::drain;
+use crate::identity::lazy_delegated_identity_client;
 use anyhow::Context;
 use prometheus_client::registry::Registry;
-use spire_api::DelegatedIdentityClient;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -323,7 +323,7 @@ pub async fn build(config: Arc<config::Config>) -> anyhow::Result<Bound> {
         mock_secret_manager()
     } else if config.spire_enabled {
         // The socket comes from the config, which defaults it when the variable is unset.
-        let dc = DelegatedIdentityClient::new_from_path(&config.spire_admin_socket).await?;
+        let dc = lazy_delegated_identity_client(&config.spire_admin_socket)?;
         Arc::new(SecretManager::new_with_spire_client(config.clone(), dc).await?)
     } else {
         Arc::new(SecretManager::new(config.clone()).await?)
