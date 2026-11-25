@@ -1,0 +1,22 @@
+# Values of the Istio ztunnel chart (1.32.0) that switch ztunnel to SPIRE.
+# run.sh sets `image` to the image under test.
+env:
+  SPIRE_ENABLED: "true"
+  SPIRE_ADMIN_ENDPOINT_SOCKET: unix:///run/spire/admin/admin.sock
+  CONTAINER_RUNTIME_SOCK_PATH: /run/containerd/containerd.sock
+volumes:
+  - name: spire-admin
+    hostPath:
+      path: /run/spire/agent/sockets/csi.spiffe.io/admin
+      type: Directory
+  - name: containerd
+    hostPath:
+      path: /run/containerd/containerd.sock
+      type: Socket
+volumeMounts:
+  - name: spire-admin
+    mountPath: /run/spire/admin
+    readOnly: true
+  - name: containerd
+    mountPath: /run/containerd/containerd.sock
+    readOnly: true

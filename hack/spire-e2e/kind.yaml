@@ -1,0 +1,9 @@
+# Two workers, so that the client and the server run on different nodes and
+# each side of the HBONE connection is a different ztunnel with its own SVIDs.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ztunnel-spire
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

@@ -1,0 +1,43 @@
+# Values of the spire umbrella chart (0.31.0) for the e2e test.
+#   https://github.com/spiffe/helm-charts-hardened/tree/main/charts/spire
+#
+# The trust domain is the cluster domain, which is the default trust domain of
+# Istio and the default SPIRE_TRUST_DOMAIN of ztunnel.
+global:
+  spire:
+    clusterName: ztunnel-spire
+    trustDomain: cluster.local
+
+spire-server:
+  caSubject:
+    country: BR
+    organization: ztunnel-spire-e2e
+    commonName: ztunnel-spire-e2e
+  controllerManager:
+    identities:
+      clusterSPIFFEIDs:
+        # Identities come from clusterspiffeids.yaml only, so that a pod outside
+        # them has no SVID (the negative case of the test).
+        default:
+          enabled: false
+
+spire-agent:
+  # The Delegated Identity API is served on the admin socket, which is made
+  # visible on the node for ztunnel to mount:
+  #   <hostBasePath>/csi.spiffe.io/admin/admin.sock
+  sockets:
+    admin:
+      enabled: true
+      mountOnHost: true
+  # ztunnel tolerates every taint and mounts the admin socket of the node, so
+  # the agent must run on the same nodes, the control plane included.
+  tolerations:
+    - operator: Exists
+  # Only ztunnel may ask for the SVIDs of other workloads.
+  authorizedDelegates:
+    - spiffe://cluster.local/ns/istio-system/sa/ztunnel
+  # kind's kubelet serves a self-signed certificate.
+  workloadAttestors:
+    k8s:
+      verification:
+        type: skip

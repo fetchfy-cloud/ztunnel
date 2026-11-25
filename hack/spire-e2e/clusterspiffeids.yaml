@@ -1,0 +1,33 @@
+# Registrations, in the SPIFFE ID format of Istio.
+#
+# ztunnel needs its own: the agent attests it on the admin socket and checks its
+# SPIFFE ID against authorizedDelegates. The workloads of the namespace
+# spire-e2e get theirs; the namespace spire-e2e-unregistered has none.
+#
+# The controller manager of the chart handles only the ClusterSPIFFEIDs of its
+# class, <release namespace>-<release name>.
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: ztunnel
+spec:
+  className: spire-mgmt-spire
+  spiffeIDTemplate: spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}
+  podSelector:
+    matchLabels:
+      app: ztunnel
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: istio-system
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: spire-e2e
+spec:
+  className: spire-mgmt-spire
+  spiffeIDTemplate: spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: spire-e2e
