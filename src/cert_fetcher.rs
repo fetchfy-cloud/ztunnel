@@ -16,7 +16,9 @@ use crate::config;
 use crate::config::ProxyMode;
 use crate::identity::Priority::Warmup;
 use crate::identity::{Identity, SecretManager};
+use crate::state::WorkloadInfo;
 use crate::state::workload::{InboundProtocol, Workload};
+use crate::strng::Strng;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -24,7 +26,7 @@ use tracing::{debug, error, info};
 /// Responsible for pre-fetching certs for workloads.
 pub trait CertFetcher: Send + Sync {
     fn prefetch_cert(&self, w: &Workload);
-    fn clear_cert(&self, id: &Identity);
+    fn clear_cert(&self, w: &Workload);
 }
 
 /// A no-op implementation of [CertFetcher].
@@ -32,7 +34,7 @@ pub struct NoCertFetcher();
 
 impl CertFetcher for NoCertFetcher {
     fn prefetch_cert(&self, _: &Workload) {}
-    fn clear_cert(&self, _: &Identity) {}
+    fn clear_cert(&self, _: &Workload) {}
 }
 
 /// Constructs an appropriate [CertFetcher] for the proxy config.
@@ -43,12 +45,17 @@ pub fn new(cfg: &config::Config, cert_manager: Arc<SecretManager>) -> Arc<dyn Ce
     }
 }
 
-/// Internal request type for the pre-fetch channel. Both variants carry an
-/// identity. Fetch runs at warmup priority. Forget removes the identity-keyed
-/// entry.
+/// Internal request type for the pre-fetch channel. Fetch runs at warmup
+/// priority. Forget removes the identity-keyed entry. ForgetWorkload removes
+/// the workload-keyed entry that SPIRE mode creates for each pod.
 enum PrefetchRequest {
     Fetch(Identity),
     Forget(Identity),
+    ForgetWorkload {
+        id: Identity,
+        uid: Strng,
+        workload: Arc<WorkloadInfo>,
+    },
 }
 
 /// A real [CertFetcher] that asynchronously forwards cert pre-fetch requests to a [SecretManager].
@@ -56,6 +63,7 @@ struct CertFetcherImpl {
     proxy_mode: ProxyMode,
     local_node: Option<String>,
     tx: mpsc::Sender<PrefetchRequest>,
+    spire_enabled: bool,
 }
 
 impl CertFetcherImpl {
@@ -84,6 +92,11 @@ impl CertFetcherImpl {
                     PrefetchRequest::Forget(workload_identity) => {
                         cert_manager.forget_certificate(&workload_identity).await;
                     }
+                    PrefetchRequest::ForgetWorkload { id, uid, workload } => {
+                        cert_manager
+                            .forget_certificate_by_workload(&id, workload, uid)
+                            .await;
+                    }
                 }
             }
         });
@@ -92,6 +105,7 @@ impl CertFetcherImpl {
             proxy_mode: cfg.proxy_mode,
             local_node: cfg.local_node.clone(),
             tx,
+            spire_enabled: cfg.spire_enabled,
         }
     }
 
@@ -104,7 +118,9 @@ impl CertFetcherImpl {
             // We only get certs for our own node
             Some(w.node.as_ref()) == self.local_node.as_deref() &&
             // If it doesn't support HBONE it *probably* doesn't need a cert.
-            (w.native_tunnel || w.protocol == InboundProtocol::HBONE)
+            (w.native_tunnel || w.protocol == InboundProtocol::HBONE) &&
+            // SPIRE attests the pod by PID, so its cert can only be fetched on demand.
+            !self.spire_enabled
     }
 }
 
@@ -117,8 +133,21 @@ impl CertFetcher for CertFetcherImpl {
         }
     }
 
-    fn clear_cert(&self, id: &Identity) {
-        if let Err(e) = self.tx.try_send(PrefetchRequest::Forget(id.clone())) {
+    fn clear_cert(&self, w: &Workload) {
+        let req = if self.spire_enabled {
+            PrefetchRequest::ForgetWorkload {
+                id: w.identity(),
+                uid: w.uid.clone(),
+                workload: Arc::new(WorkloadInfo::new(
+                    w.name.to_string(),
+                    w.namespace.to_string(),
+                    w.service_account.to_string(),
+                )),
+            }
+        } else {
+            PrefetchRequest::Forget(w.identity())
+        };
+        if let Err(e) = self.tx.try_send(req) {
             info!("couldn't clear identity: {:?}", e)
         }
     }

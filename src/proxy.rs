@@ -178,6 +178,7 @@ pub struct LocalWorkloadInformation {
     // full_cert_manager gives access to the full SecretManager. This MUST only be given restricted
     // access to the appropriate certificates
     full_cert_manager: Arc<SecretManager>,
+    cfg: Arc<config::Config>,
 }
 
 impl LocalWorkloadInformation {
@@ -185,11 +186,13 @@ impl LocalWorkloadInformation {
         wi: Arc<WorkloadInfo>,
         state: DemandProxyState,
         cert_manager: Arc<SecretManager>,
+        cfg: Arc<config::Config>,
     ) -> LocalWorkloadInformation {
         LocalWorkloadInformation {
             wi,
             state,
             full_cert_manager: cert_manager,
+            cfg: cfg.clone(),
         }
     }
 
@@ -210,7 +213,14 @@ impl LocalWorkloadInformation {
             namespace: (&self.wi.namespace).into(),
             service_account: (&self.wi.service_account).into(),
         };
-        self.full_cert_manager.fetch_certificate(id).await
+        if self.cfg.spire_enabled {
+            // SPIRE attests each pod by PID, so the cache entry is keyed by workload.
+            self.full_cert_manager
+                .fetch_certificate_by_workload(id, self.wi.clone(), wl.uid.clone())
+                .await
+        } else {
+            self.full_cert_manager.fetch_certificate(id).await
+        }
     }
 
     pub fn workload_info(&self) -> Arc<WorkloadInfo> {

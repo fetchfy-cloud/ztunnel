@@ -19,6 +19,9 @@ use std::sync::Arc;
 mod caclient;
 pub use caclient::*;
 
+mod spireclient;
+pub use spireclient::*;
+
 pub mod manager;
 pub use manager::*;
 
@@ -56,6 +59,20 @@ pub enum Error {
     BugInvalidIdentityRequest(Identity, Arc<WorkloadInfo>),
     #[error("BUG: per-identity CA received a workload-keyed fetch: {0}")]
     BugWorkloadKeyedFetch(String),
+    #[error("failed to fetch bundle for workload: {0}")]
+    FailedToFetchBundle(String),
+    #[error("certificate is in invalid format")]
+    CertificateInvalidFormat(),
+    #[error("invalid trust domain: {0}")]
+    InvalidTrustDomain(String),
+    #[error("failed to fetch certificate for workload: {0}")]
+    FailedToFetchCertificate(String),
+    #[error("failed to fetch pid for workload: {0}")]
+    FailedToFetchPidForWorkload(i32),
+    #[error("unable to determine pid for workload: {0}")]
+    UnableToDeterminePidForWorkload(String),
+    #[error("invalid configuration: {0}")]
+    InvalidConfiguration(String),
 }
 
 impl From<tls::Error> for Error {
