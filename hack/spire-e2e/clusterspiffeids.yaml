@@ -6,6 +6,8 @@
 #
 # The controller manager of the chart handles only the ClusterSPIFFEIDs of its
 # class, <release namespace>-<release name>.
+#
+# The SVIDs of spire-e2e live 60s, so they renew every ~30s while the test runs.
 ---
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
@@ -28,6 +30,7 @@ metadata:
 spec:
   className: spire-mgmt-spire
   spiffeIDTemplate: spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}
+  ttl: 60s
   namespaceSelector:
     matchLabels:
       kubernetes.io/metadata.name: spire-e2e

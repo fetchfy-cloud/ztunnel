@@ -4,6 +4,9 @@ env:
   SPIRE_ENABLED: "true"
   SPIRE_ADMIN_ENDPOINT_SOCKET: unix:///run/spire/admin/admin.sock
   CONTAINER_RUNTIME_SOCK_PATH: /run/containerd/containerd.sock
+  # One request per HBONE connection, so each request makes a new mTLS
+  # handshake and the renewal check exercises every new certificate.
+  POOL_MAX_STREAMS_PER_CONNECTION: "1"
 volumes:
   - name: spire-admin
     hostPath:

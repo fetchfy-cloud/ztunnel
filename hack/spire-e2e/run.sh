@@ -6,7 +6,9 @@
 #   2. the certificates ztunnel holds for both pods are SVIDs issued under the
 #      SPIRE bundle, one cache entry per pod;
 #   3. a pod in the mesh without a SPIRE registration gets no certificate and
-#      cannot reach the server.
+#      cannot reach the server;
+#   4. the 60s SVIDs renew several times under continuous traffic without a
+#      single failed request, and without fetching in a loop.
 #
 # Usage: ZTUNNEL_IMAGE=<image> hack/spire-e2e/run.sh [--keep]
 # --keep leaves the cluster up for inspection; otherwise it is deleted.
@@ -35,6 +37,38 @@ trap cleanup EXIT
 
 step() { echo "==> $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+ztunnel_on() {
+  kubectl -n istio-system get pod -l app=ztunnel --field-selector spec.nodeName="$1" \
+    -o jsonpath='{.items[0].metadata.name}'
+}
+
+# Prints the config_dump of the ztunnel on a node. The admin endpoint listens
+# on localhost inside the pod.
+config_dump() {
+  local pf dump
+  kubectl -n istio-system port-forward "pod/$(ztunnel_on "$1")" 25000:15000 >/dev/null 2>&1 &
+  pf=$!
+  sleep 3
+  dump=$(curl -sS --max-time 10 http://localhost:25000/config_dump) || { kill "$pf"; return 1; }
+  kill "$pf"
+  wait "$pf" 2>/dev/null || true
+  echo "$dump"
+}
+
+# Prints the validity start of the certificate of a SPIFFE ID in a config_dump.
+valid_from() {
+  python3 -I -c '
+import json, sys
+want = sys.argv[1]
+print(next(c["certChain"][0]["validFrom"] for c in json.load(sys.stdin)["certificates"] if c["identity"] == want))
+' "$1"
+}
+
+# Counts the certificate fetches ztunnel logged for a pod so far.
+fetches_of() {
+  kubectl -n istio-system logs "$(ztunnel_on "$1")" --tail=-1 | grep -c "Fetching PID for pod: $2" || true
+}
 
 step "kind cluster"
 "$KIND" create cluster --config "$HERE/kind.yaml" --kubeconfig "$KUBECONFIG" --wait 120s
@@ -82,14 +116,7 @@ bundle=$(mktemp)
 kubectl -n spire-mgmt exec spire-server-0 -c spire-server -- \
   /opt/spire/bin/spire-server bundle show -format pem > "$bundle"
 for node in ztunnel-spire-worker ztunnel-spire-worker2; do
-  pod=$(kubectl -n istio-system get pod -l app=ztunnel --field-selector spec.nodeName="$node" \
-    -o jsonpath='{.items[0].metadata.name}')
-  # The admin endpoint listens on localhost inside the pod.
-  kubectl -n istio-system port-forward "pod/$pod" 25000:15000 >/dev/null 2>&1 &
-  pf=$!
-  sleep 3
-  dump=$(curl -sS --max-time 10 http://localhost:25000/config_dump) || { kill "$pf"; fail "config_dump of $pod"; }
-  kill "$pf"
+  dump=$(config_dump "$node") || fail "config_dump on $node"
   python3 -I "$HERE/verify_certs.py" "$bundle" "$node" <<<"$dump" || fail "certificates on $node"
 done
 
@@ -109,5 +136,34 @@ for _ in $(seq 1 12); do
   sleep 5
 done
 [[ -n "$logged" ]] || fail "ztunnel logs do not show the failed attestation of the unregistered pod"
+
+step "4. SVIDs renew under traffic"
+# The SVIDs live 60s; 150s of traffic outlasts each one more than twice, so
+# no request can succeed throughout unless both pods renew. Each request is a
+# new mTLS handshake (POOL_MAX_STREAMS_PER_CONNECTION=1).
+client_id=spiffe://cluster.local/ns/spire-e2e/sa/client
+before=$(config_dump ztunnel-spire-worker | valid_from "$client_id") || fail "config_dump on ztunnel-spire-worker"
+fetches_before=$(fetches_of ztunnel-spire-worker spire-e2e/client)
+result=$(kubectl -n spire-e2e exec client -- sh -c '
+  ok=0; failed=0; end=$(( $(date +%s) + 150 ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    if curl -sS -o /dev/null --max-time 2 http://server:8080/hostname 2>/dev/null; then
+      ok=$((ok + 1))
+    else
+      failed=$((failed + 1)); echo "failed at $(date +%T)" >&2
+    fi
+    sleep 0.2
+  done
+  echo "$ok $failed"')
+read -r ok failed <<<"$result"
+after=$(config_dump ztunnel-spire-worker | valid_from "$client_id") || fail "config_dump on ztunnel-spire-worker"
+fetches=$(( $(fetches_of ztunnel-spire-worker spire-e2e/client) - fetches_before ))
+echo "requests: $ok ok, $failed failed; client certificate valid from $before, then $after; $fetches fetches"
+[[ "$failed" -eq 0 && "$ok" -gt 0 ]] || fail "$failed of $((ok + failed)) requests failed while the SVIDs renewed"
+[[ "$after" != "$before" ]] || fail "the client certificate was not renewed"
+# About 5 renewals in 150s. Each takes the fetch at half-life plus a retry
+# every 5s until the agent rotates the SVID, at most ~3 fetches; fetching in a
+# loop would make hundreds.
+[[ "$fetches" -le 20 ]] || fail "$fetches certificate fetches for the client in 150s: fetching in a loop"
 
 echo "PASS"
